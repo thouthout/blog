@@ -2,6 +2,6 @@
 java基础、JVM、类加载机制、垃圾回收机制、高并发、锁、线程、IO/NIO
 SSM、springboot、springcloud
 mysql、分库分表、乐观锁、悲观锁、sql优化、存储引擎、B+树
-zookeeper、kafka、activimq、redis、ELK、dubbo、
+zookeeper、kafka、activimq、redis、ELK、dubbo、Nginx、mycat
 NFS TSDB、devops、jinkens、docker
 pass、sass、中台
