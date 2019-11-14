@@ -1,0 +1,47 @@
+find / -name "include.property"   根目录开始查找这个文件
+find /opt -name "*.log"|xargs grep "ERROR"  查找/opt下面所有.log结尾的文件中有ERROR的
+find /opt -name "*.log"|xargs -i cp {} /tmp  查找这个文件拷贝到/tmp下
+grep -r "strring" 查找有这个字符串的文件
+df -h 查看那些文件是挂载的
+umount  卸载
+mount  挂载文件
+chown -R ossuser:ossgroup /opt/oss/AdapaterRouterService    更改/opt/oss/AdapaterRouterService目录权限，ossuer用户，ossgroup组
+netstat -an|grep 9093   查看9093端口的使用情况
+lsof -i:8113       查看远程调试的ip是不是接通
+ps -ef|grep kafka   查看kafka服务进程的情况
+cat server.log grep| "ERROR"  查看server.log中有ERROR的字段
+iostat -x 1 3   查看性能情况    lscup也可以
+ln -s /opt/backup /home/ossadm/backup   新建/home/ossadm/backup目录软链接指向/opt/backup
+du -sh /opt     查看opt目录的大小
+tar -zcvf /home/xahot.tar.gz /xahot   打包后生成的文件名全路径 要打包的目录
+tar -zxf xahot.tar.gz  解压
+scp -r /root/lk root@43.224.34.73:/home/lk/cpfile   远程拷贝
+lsblk   查看挂载
+rmp -qa |grep openssh   查看安装的版本
+uname -a    查看镜像版本
+set his
+set nu
+
+mvn dependency:tree > test.log
+mvn clean package -Dmaven.test.skip=true
+mvn package -Psign
+
+
+
+连接高斯，在service节点的话：
+export LD_LIBRARY_PATH=/opt/mateinfo/zenith
+/opt/mateinfo/zenith/zsql mateinfo/Changeme_123@127.0.0.1:26772 -q
+
+ipmc_adm -cmd statusapp -tenant manager 
+
+循环解压
+# for i in *.zip
+> do
+> unzip -o $i
+> done
+
+
+
+crontab -e  修改文件，添加定时任务
+crontab -l  查看添加的任务
+systemctl restart crond  重启定时任务生效
