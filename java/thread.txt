@@ -1,0 +1,642 @@
+package com.huawei.nfvo.nfvcatalogdrservice.common.util.thread;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.StringUtils;
+
+import com.huawei.bsp.remoteservice.exception.ServiceException;
+import com.huawei.nfvo.common.constant.ErrorCode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import com.huawei.nfvo.common.logger.formatter.FormatBuilder;
+import com.huawei.nfvo.common.utils.ExecutorsUtil;
+import com.huawei.nfvo.nfvcatalogdrservice.common.util.file.SecurityUtil;
+import com.huawei.nfvo.nfvcatalogdrservice.service.drcommon.ITaskFinishedCallback;
+import com.huawei.nfvo.nfvcatalogdrservice.service.drcommon.ITaskProgressCallback;
+
+/**
+ * Description: [系统调用工具类，调用系统命令、Shell脚本都从这里入口]<br>
+ * 
+ */
+public abstract class ExecShellCmdUtil
+{
+    /**
+     * Logger
+     */
+	private static final Logger LOGGER = LoggerFactory.getLogger(ExecShellCmdUtil.class);
+
+    /**
+     * 换行符
+     */
+    private static final String NEXT_LINE = System.getProperty("line.separator");
+
+    /**
+     * 流读取间隔：1秒
+     */
+    private static final int STREAM_READ_SEP = 1000;
+
+    /**
+     * 时间转换单位
+     */
+    private static final int TIME_CONVERT_UNIT = 1000;
+
+    /**
+     * 缓冲区最大值：1MB
+     */
+    private static final int BUFF_MAX_SIZE = 1024 * 1024;
+
+    /**
+     * 输入流准备时间：10毫秒
+     */
+    private static final int STREAM_READY_TIME = 10;
+
+    /**
+     * 错误输出标志
+     */
+    private static final String ERROR_OUTPUT = "ERR";
+
+    /**
+     * 标准输出标志
+     */
+    private static final String STD_OUTPUT = "STD";
+
+    /**
+     * 命令执行成功状态码
+     */
+    public static final int SUCCESS = 0;
+
+    /**
+     * 命令行非法字符集
+     */
+    private static final String[] INVALID_CMD_CHARS = new String[] { "|", "`", "&", ";" };
+
+    /**
+     * 单例模式
+     */
+    private ExecShellCmdUtil()
+    {
+
+    }
+
+    /**
+     * 异步调用系统命令<br>
+     * 
+     * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+     * @param cmd 系统命令
+     * @param timeoutSec 超时时间：秒
+     * @param message 交互输入信息
+     * @param finishedCallback 任务结束回调接口实现对象
+     * @param progressCallback 任务执行过程中的回调接口对象
+     */
+    public static void execute(final String[] cmd, long timeoutSec, Map<String, InteractiveMsg> message, ITaskFinishedCallback finishedCallback,
+            ITaskProgressCallback progressCallback)
+    {
+        // 通过异步执行线程实现异步调用
+        AsyncExecThread execThread = new AsyncExecThread(cmd, timeoutSec, message, finishedCallback, progressCallback);
+        ExecutorsUtil.threadPool().execute(execThread);
+    }
+
+    /**
+     * 校验命令字符，不允许出现|`&;等字符<br>
+     * 
+     * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+     * @param cmd
+     * @return
+     */
+    private static boolean validateCmdChar(String[] cmd)
+    {
+        String cmdStr = Arrays.toString(cmd);
+
+        // 遍历非法字符集，如果命令行中包含非法字符，则直接返回false
+        for (String str : INVALID_CMD_CHARS)
+        {
+            if (cmdStr.contains(str))
+            {
+                String errorLog = FormatBuilder.buildInternalServerError("validateCmdChar", ErrorCode.COMMON_PARAM_INVALID,
+                        "the command contains invalid string : " + str);
+                LOGGER.error("function=validateCmdChar , msg = {}", errorLog);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 同步调用系统命令<br>
+     * 
+     * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+     * @param cmd 系统命令：第一个参数为命令本身，后面的参数为命令的参数
+     * @param timeoutSec 超时时间：秒
+     * @param message 交互输入信息
+     * @param progressCallback 执行过程回调接口对象，用于输出任务执行过程中的标准输出内容并接受任务是否终止指令
+     * @return 执行结果
+     */
+    public static ExecShellCmdResp execute(final String[] cmd, long timeoutSec, Map<String, InteractiveMsg> message,
+            ITaskProgressCallback progressCallback)
+    {
+        if (ArrayUtils.isEmpty(cmd))
+        {
+            String errorLog = FormatBuilder.buildInternalServerError("execute", ErrorCode.COMMON_INNERSERVICE_HANDLER_ERROR,
+                    "the command is null or empty! ");
+            LOGGER.error("function=execute , msg = {}", errorLog);
+            return null;
+        }
+
+        // 包含非法字符直接报错返回
+        if (!validateCmdChar(cmd))
+        {
+            String errorLog = FormatBuilder.buildInternalServerError("execute", ErrorCode.COMMON_PARAM_INVALID, "invalid command! ");
+            LOGGER.error("function=execute , msg = {}", errorLog);
+            return null;
+        }
+
+        long timeoutMiliSec = timeoutSec * TIME_CONVERT_UNIT;
+        Process process = null;
+        StreamReader errorOutReader = null;
+        StreamReader stdOutReader = null;
+        ExecShellCmdResp response = new ExecShellCmdResp();
+        try
+        {
+            LOGGER.warn("start to excute the cmd ,start time is {}", System.currentTimeMillis());
+            // 执行命令
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            process = pb.start();
+
+            // 错误输出
+            StringBuffer errorResult = new StringBuffer();
+            errorOutReader = new StreamReader(process.getErrorStream(), process.getOutputStream(), message, errorResult, ERROR_OUTPUT);
+
+            // 标准输出
+            StringBuffer stdResult = new StringBuffer();
+            stdOutReader = new StreamReader(process.getInputStream(), process.getOutputStream(), message, stdResult, STD_OUTPUT);
+
+            // 必须先等待错误输出ready再建立标准输出
+            ExecutorsUtil.threadPool().execute(errorOutReader);
+            while (!errorOutReader.isReady())
+            {
+                ThreadUtil.wait(STREAM_READY_TIME);
+            }
+
+            // 建立标准输出流读取线程
+            ExecutorsUtil.threadPool().execute(stdOutReader);
+            while (!stdOutReader.isReady())
+            {
+                ThreadUtil.wait(STREAM_READY_TIME);
+            }
+            LOGGER.warn("start to execute shell command.");
+
+            // 启动等待线程
+            WaitForThread waitForThread = new WaitForThread(process);
+            ExecutorsUtil.threadPool().execute(waitForThread);
+
+            long startTime = System.currentTimeMillis();
+            long nowTime = startTime;
+
+            // 检测命令执行是否结束
+            while (!waitForThread.isFinish())
+            {
+                // 命令超时的时候设置标准输出和错误输出读取线程的超时标志，通知两个线程不再读取，超时时间为0则不关注是否超时
+                if (timeoutMiliSec != 0 && nowTime - startTime > timeoutMiliSec)
+                {
+                    String errorLog = FormatBuilder.buildInternalServerError("execute", ErrorCode.COMMON_INNERSERVICE_HANDLER_ERROR,
+                            "the command execution is timeout! ");
+                    LOGGER.error("function=execute , msg = {}, timeoutSec = {}", errorLog, timeoutSec);
+                    errorOutReader.setTimeout(1);
+                    stdOutReader.setTimeout(1);
+                    break;
+                }
+                else
+                {
+                    // 如果传入了过程回调对象，需要处理过程变量
+                    if (null != progressCallback)
+                    {
+                        // 根据回调返回的接口确定是否终止任务
+                        boolean continueFlag = progressCallback.callback(stdResult.toString());
+                        if (!continueFlag)
+                        {
+                            errorOutReader.setTimeout(1);
+                            stdOutReader.setTimeout(1);
+                            break;
+                        }
+                    }
+
+                    // 间隔1秒继续等待
+                    ThreadUtil.wait(STREAM_READ_SEP);
+                    nowTime = System.currentTimeMillis();
+                }
+            }
+            LOGGER.warn("finished to execute shell command.");
+
+            // 组装标准输出、错误输出和状态码并返回
+            response.setErrOut(errorResult.toString());
+            response.setStdOut(stdResult.toString());
+            response.setRetCode(waitForThread.getExitValue());
+        }
+        catch (IOException e)
+        {
+            String errorLog = FormatBuilder.buildInternalServerError("execute", ErrorCode.COMMON_INNERSERVICE_HANDLER_ERROR,
+                    "Synchronous task IO exception");
+            LOGGER.error("function=execute, msg = {}", errorLog);
+        }
+        finally
+        {
+            stopProcess(process, errorOutReader, stdOutReader);
+            LOGGER.warn("end to excute the cmd ,end time is {}", System.currentTimeMillis());
+        }
+
+        return response;
+    }
+
+    /**
+     * 停止进程<br>
+     * 
+     * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+     * @param process 进程对象
+     * @param errorOutReader 错误输出读取线程
+     * @param stdOutReader 标准输出读取线程
+     */
+    private static void stopProcess(Process process, StreamReader errorOutReader, StreamReader stdOutReader)
+    {
+        // 确保错误输出线程可以顺利结束
+        if (null != errorOutReader)
+        {
+            errorOutReader.setTimeout(1);
+        }
+
+        // 确保标准输出线程可以顺利结束
+        if (null != stdOutReader)
+        {
+            stdOutReader.setTimeout(1);
+        }
+
+        // 停止进程
+        if (process != null)
+        {
+            process.destroyForcibly();
+        }
+    }
+
+    /**
+     * 简化命令<br>
+     * 
+     * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+     * @param cmd 原始命令
+     * @return 简化后的命令
+     */
+    private static String simplifyCmd(String cmd)
+    {
+        // 如果命令行包含路径分隔符，只取最后一段
+        if (cmd.contains(File.separator))
+        {
+            return cmd.substring(cmd.lastIndexOf(File.separator) + 1);
+        }
+
+        return cmd;
+    }
+
+    /**
+     * Description: [异步执行系统命令线程]<br>
+     * 
+     */
+    private static class AsyncExecThread implements Runnable
+    {
+        /**
+         * 系统命令
+         */
+        private String[] cmd;
+
+        /**
+         * 超时时间：秒
+         */
+        private long timeoutSec;
+
+        /**
+         * 交互信息：key：控制台提示符，value：需要输入的值
+         */
+        private Map<String, InteractiveMsg> message;
+
+        /**
+         * 任务执行结束的回调接口对象
+         */
+        private ITaskFinishedCallback finishedCallback;
+
+        /**
+         * 任务执行过程中的回调接口对象
+         */
+        private ITaskProgressCallback progressCallback;
+
+        /**
+         * 构造函数<br>
+         * <br>
+         * 
+         * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+         * @param cmd 系统命令
+         * @param timeoutSec 超时时间：秒
+         * @param message 交互输入信息
+         * @param finishedCallback 回调接口对象
+         * @param progressCallback
+         */
+        AsyncExecThread(String[] cmd, long timeoutSec, Map<String, InteractiveMsg> message, ITaskFinishedCallback finishedCallback,
+                ITaskProgressCallback progressCallback)
+        {
+            this.cmd = cmd;
+            this.timeoutSec = timeoutSec;
+            this.message = message;
+            this.finishedCallback = finishedCallback;
+            this.progressCallback = progressCallback;
+        }
+
+        /**
+         * 线程执行方法<br>
+         * <br>
+         * 
+         * @see java.lang.Runnable#run()
+         * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+         */
+        @Override
+        public void run()
+        {
+            ExecShellCmdResp resp = execute(cmd, timeoutSec, message, progressCallback);
+            finishedCallback.callback(resp, simplifyCmd(cmd[0]));
+        }
+
+    }
+
+    /**
+     * Description: [输入流读取线程]<br>
+     * 
+     */
+    private static class StreamReader implements Runnable
+    {
+        /**
+         * 输入流
+         */
+        private InputStream is;
+
+        /**
+         * 输出流
+         */
+        private OutputStream out;
+
+        /**
+         * 交互信息
+         */
+        private Map<String, InteractiveMsg> message;
+
+        /**
+         * 线程就绪标志
+         */
+        private boolean ready = false;
+
+        /**
+         * 命令执行结果,0:执行中 1:超时
+         */
+        private int commandResult = 0;
+
+        /**
+         * 输入流类型
+         */
+        private String isType;
+
+        /**
+         * 输出结果
+         */
+        private StringBuffer result;
+
+        /**
+         * 构造函数<br>
+         * <br>
+         * 
+         * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+         * @param is 输入流
+         * @param out 输出流
+         * @param message 交互信息
+         * @param result 流结果
+         * @param command 执行命令
+         * @param isType 输入流类型
+         */
+        StreamReader(InputStream is, OutputStream out, Map<String, InteractiveMsg> message, StringBuffer result, String isType)
+        {
+            this.is = is;
+            this.out = out;
+            this.message = message;
+            this.isType = isType;
+            this.result = result;
+        }
+
+        /**
+         * 线程执行方法<br>
+         * <br>
+         * 
+         * @see java.lang.Runnable#run()
+         * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+         */
+        @Override
+        public void run()
+        {
+            try
+            {
+                ready = true;
+                byte[] buf = new byte[1024];
+                int len = 0;
+
+                // 循环读取输入流的时候需要判断线程有没有超时
+                while ((len = is.read(buf)) > -1)
+                {
+                    String line = new String(buf, 0, len, "UTF-8");
+                    result.append(line);
+                    inputInteractiveMsg(result.toString());
+
+                    // 超时直接返回
+                    if (commandResult == 1)
+                    {
+                        break;
+                    }
+
+                    // 缓冲区超过1MB要清空
+                    if (result.length() > BUFF_MAX_SIZE)
+                    {
+                        result.delete(0, BUFF_MAX_SIZE);
+                    }
+                }
+            }
+            catch (IOException e)
+            {
+                String errorLog = FormatBuilder.buildInternalServerError("StreamReader", ErrorCode.COMMON_INNERSERVICE_HANDLER_ERROR,
+                        "failed to read Stream.");
+                LOGGER.error("function=run , msg = {}", errorLog);
+            }
+            catch (ServiceException e)
+            {
+                String errorLog = FormatBuilder.buildInternalServerError("StreamReader", ErrorCode.COMMON_INNERSERVICE_HANDLER_ERROR,
+                        "failed to inputInteractiveMsg.");
+                LOGGER.error("function=run , msg = {}", errorLog);
+            }
+            finally
+            {
+                IOUtils.closeQuietly(is);
+            }
+        }
+
+        /**
+         * 输入交互信息<br>
+         * 
+         * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+         * @param line 行
+         * @throws ServiceException
+         */
+        private void inputInteractiveMsg(String line) throws ServiceException
+        {
+            if (null == out || null == message)
+            {
+                LOGGER.info("the out stream or message is empty! stream : {}", isType);
+                return;
+            }
+            line = line.trim();
+
+            // 匹配交互信息中的字符串，如果匹配上则将预定义好的信息发送到标准输出
+            Set<Entry<String, InteractiveMsg>> entrySet = message.entrySet();
+            Iterator<Entry<String, InteractiveMsg>> it = entrySet.iterator();
+            while (it.hasNext())
+            {
+                Entry<String, InteractiveMsg> entry = it.next();
+                InteractiveMsg value = entry.getValue();
+                if (!line.endsWith(entry.getKey()) || null == entry.getValue())
+                {
+                    continue;
+                }
+
+                // 非空判断，此处必须判断等于null
+                String outMsg = value.getMessage();
+                if (StringUtils.isBlank(outMsg))
+                {
+                    continue;
+                }
+
+                // 加密的字符串需要解密
+                if (value.isEncrypt())
+                {
+                    char[] encryptStr = outMsg.toCharArray();
+                    char[] decryptStr = SecurityUtil.decrypt(outMsg.toCharArray());
+                    if (null == decryptStr)
+                    {
+                        String errorLog = FormatBuilder.buildInternalServerError("inputInteractiveMsg", ErrorCode.COMMON_INNERSERVICE_HANDLER_ERROR,
+                                "failed to decrypt decryptStr.");
+                        LOGGER.error("function=inputInteractiveMsg , msg = {}", errorLog);
+
+                        throw new ServiceException("failed to decrypt decryptStr");
+                    }
+                    outMsg = new String(decryptStr);
+                    SecurityUtil.clearMessage(decryptStr);
+                    SecurityUtil.clearMessage(encryptStr);
+                }
+
+                // 发送交互信息
+                try
+                {
+                    out.write((outMsg + NEXT_LINE).getBytes("UTF-8"));
+                    out.flush();
+                }
+                catch (IOException e)
+                {
+                    String errorLog = FormatBuilder.buildInternalServerError("inputInteractiveMsg", ErrorCode.COMMON_INNERSERVICE_HANDLER_ERROR,
+                            "failed to send interactive message! ");
+                    LOGGER.error("function=inputInteractiveMsg , msg = {}", errorLog);
+                }
+            }
+        }
+
+        public boolean isReady()
+        {
+            return ready;
+        }
+
+        public void setTimeout(int timeout)
+        {
+            this.commandResult = timeout;
+        }
+
+    }
+
+    /**
+     * Description: [等待系统命令执行结束线程]<br>
+     * 
+     */
+    private static class WaitForThread implements Runnable
+    {
+        /**
+         * 进程对象
+         */
+        private Process process;
+
+        /**
+         * 系统调用结束标志
+         */
+        private boolean finish = false;
+
+        /**
+         * 系统命令执行返回值
+         */
+        private int exitValue = -1;
+
+        /**
+         * 构造函数<br>
+         * <br>
+         * 
+         * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+         * @param process
+         */
+        public WaitForThread(Process process)
+        {
+            this.process = process;
+        }
+
+        /**
+         * 线程执行方法<br>
+         * <br>
+         * 
+         * @see java.lang.Runnable#run()
+         * @see [相关类，可选、也可多条，对于重要的类或接口建议注释]
+         */
+        @Override
+        public void run()
+        {
+            LOGGER.warn("start in to WaitForThread!");
+            try
+            {
+                this.exitValue = process.waitFor();
+            }
+            catch (InterruptedException e)
+            {
+                String errorLog = FormatBuilder.buildInternalServerError("WaitForThread", ErrorCode.COMMON_INNERSERVICE_HANDLER_ERROR,
+                        "failed to exec command!");
+                LOGGER.error("function=run , msg = {}", errorLog);
+            }
+            finally
+            {
+                finish = true;
+            }
+        }
+
+        public boolean isFinish()
+        {
+            return finish;
+        }
+
+        public int getExitValue()
+        {
+            return exitValue;
+        }
+    }
+}
